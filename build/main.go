@@ -46,8 +46,8 @@ var supportedTargets = []Target{
 }
 
 type BuildFlags struct {
-	Os, Arch, Output *string
-	PrintTargets     *bool
+	Os, Arch, Output      *string
+	PrintTargets, Verbose *bool
 }
 
 func setupCLI() *cli.Command {
@@ -63,6 +63,7 @@ func setupCLI() *cli.Command {
 		Arch:         cFlags.String("arch", runtime.GOARCH, "Sets the target architecture (defaults to the host architecture)"),
 		PrintTargets: cFlags.Bool("targets", false, "Print the supported build targets"),
 		Output:       cFlags.String("output", "", "Outputs the executable to the given filepath or directory (defaults to cwd)"),
+		Verbose:      cFlags.Bool("verbose", false, ""),
 	}
 
 	cmd.Run = func(ctx *cli.Context, args []string) {
@@ -76,7 +77,7 @@ func setupCLI() *cli.Command {
 
 func main() {
 	if err := cli.Execute(context.Background(), setupCLI(), os.Args[1:]); err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -96,23 +97,23 @@ func main2(flags BuildFlags, args []string) int {
 	target := Target{os: *flags.Os, arch: *flags.Arch}
 
 	if !target.isValid() {
-		fmt.Printf("unsupported build target OS=%s ARCH=%s\n", target.os, target.arch)
-		fmt.Println("use -targets flag to see supported targets")
+		fmt.Fprintf(os.Stderr, "unsupported build target OS=%s ARCH=%s\n", target.os, target.arch)
+		fmt.Fprintln(os.Stderr, "use -targets flag to see supported targets")
 		return 1
 	}
 
 	absPkgPath, err := filepath.Abs(args[0])
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 
 	pkgs, err := parser.ParseDir(token.NewFileSet(), absPkgPath, nil, parser.SkipObjectResolution|parser.ParseComments)
 	if err != nil {
 		if pkgs == nil {
-			fmt.Printf("error reading package directory '%s': %s", absPkgPath, err)
+			fmt.Fprintf(os.Stderr, "error reading package directory '%s': %s", absPkgPath, err)
 		} else {
-			fmt.Printf("parse error: %s", err)
+			fmt.Fprintf(os.Stderr, "parse error: %s", err)
 		}
 		return 1
 	}
@@ -121,7 +122,7 @@ func main2(flags BuildFlags, args []string) int {
 	// Should we compile directories containing multiple packages?
 	// You'd have to analyze the import-graph to figure out which subpackages to include though.
 	if len(pkgs) != 1 {
-		fmt.Println("Build only supports building a single package, found: %d", len(pkgs))
+		fmt.Fprintln(os.Stderr, "Build only supports building a single package, found", len(pkgs))
 		return 1
 	}
 
@@ -153,7 +154,7 @@ func main2(flags BuildFlags, args []string) int {
 	}
 
 	if err := os.MkdirAll("/sys/tmp/build", 0755); err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 
@@ -163,7 +164,7 @@ func main2(flags BuildFlags, args []string) int {
 	if hasEmbeds {
 		embedcfgPath, err = generateEmbedConfig(embedPatterns, absPkgPath)
 		if err != nil {
-			fmt.Println("unable to generate embedcfg:", err)
+			fmt.Fprintln(os.Stderr, "unable to generate embedcfg:", err)
 			return 1
 		}
 	}
@@ -172,7 +173,7 @@ func main2(flags BuildFlags, args []string) int {
 	importcfgPath := strings.Join([]string{"/sys/tmp/build/importcfg", target.os, target.arch}, "_")
 	importcfg, err := os.Create(importcfgPath)
 	if err != nil {
-		fmt.Println("unable to create importcfg:", err)
+		fmt.Fprintln(os.Stderr, "unable to create importcfg:", err)
 		return 1
 	}
 
@@ -181,17 +182,17 @@ func main2(flags BuildFlags, args []string) int {
 		fmt.Fprintf(bw, "packagefile %s=/sys/tmp/build/pkg/targets/%s_%s/%[1]s.a\n", strings.Trim(i, "\""), target.os, target.arch)
 	}
 	if err := bw.Flush(); err != nil {
-		fmt.Println("unable to write to importcfg:", err)
+		fmt.Fprintln(os.Stderr, "unable to write to importcfg:", err)
 		return 1
 	}
 	if err := importcfg.Close(); err != nil {
-		fmt.Println("unable to write to importcfg:", err)
+		fmt.Fprintln(os.Stderr, "unable to write to importcfg:", err)
 		return 1
 	}
 
-	fmt.Println("Unpacking pkg.zip...")
+	printfv(*flags.Verbose, "Unpacking pkg.zip...\n")
 	if err := openZipPkg("/sys/tmp/build", target); err != nil {
-		fmt.Println("unable to open pkg.zip:", err)
+		fmt.Fprintln(os.Stderr, "unable to open pkg.zip:", err)
 		return 1
 	}
 
@@ -211,11 +212,11 @@ func main2(flags BuildFlags, args []string) int {
 	compileArgs = append(compileArgs, filePaths...)
 
 	// run compile.wasm
-	fmt.Printf("Compiling %s to %s\n", args[0], objPath)
+	printfv(*flags.Verbose, "Compiling %s to %s\n", args[0], objPath)
 	exitcode, err := run("/sys/tmp/build/pkg/compile.wasm", compileArgs...)
 	if exitcode != 0 || err != nil {
 		if err != nil {
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, err)
 			if exitcode == 0 {
 				exitcode = 1
 			}
@@ -227,12 +228,12 @@ func main2(flags BuildFlags, args []string) int {
 
 	output, err := getOutputPath(target.arch, *flags.Output, pkg.Name, absPkgPath)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 
 	// run link.wasm using importcfg_$GOOS_$GOARCH.link
-	fmt.Println("Linking", objPath)
+	printfv(*flags.Verbose, "Linking %s\n", objPath)
 	exitcode, err = run(
 		"/sys/tmp/build/pkg/link.wasm",
 		"-importcfg", linkcfg,
@@ -242,7 +243,7 @@ func main2(flags BuildFlags, args []string) int {
 	)
 	if exitcode != 0 || err != nil {
 		if err != nil {
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, err)
 			if exitcode == 0 {
 				exitcode = 1
 			}
@@ -250,8 +251,16 @@ func main2(flags BuildFlags, args []string) int {
 		return exitcode
 	}
 
-	fmt.Println("Output", output)
+	printfv(*flags.Verbose, "Output %s\n", output)
 	return 0
+}
+
+// Prints to stdout if verbose is true
+func printfv(verbose bool, format string, a ...any) (n int, err error) {
+	if verbose {
+		return fmt.Printf(format, a...)
+	}
+	return 0, nil
 }
 
 func findEmbedDirectives(comments []*ast.CommentGroup) (patterns []string) {
